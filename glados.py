@@ -2,6 +2,7 @@ import json
 import os
 import re
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 import requests
@@ -21,11 +22,16 @@ CHECKIN_PAGE = f"{BASE_URL}/console/checkin"
 PAGE_TIMEOUT = 30_000
 CHECKIN_TIMEOUT = 20_000
 
+# 默认使用 headed 模式，保持你当前 GitHub macOS Runner 的行为。
+# 如需 headless：
+# HEADLESS=1 python glados.py
+HEADLESS = os.environ.get("HEADLESS", "0") == "1"
+
 SAVE_DEBUG_SCREENSHOT = (
     os.environ.get("SAVE_DEBUG_SCREENSHOT", "0") == "1"
 )
 
-RISK_CONTROL_KEYWORDS = (
+RISK_KEYWORDS = (
     "automated check-in",
     "automated checkin",
     "sign in again",
@@ -50,6 +56,25 @@ SUCCESS_KEYWORDS = (
     "check-in! got",
     "today's observation logged",
 )
+
+
+# =============================================================================
+# 类型
+# =============================================================================
+
+@dataclass
+class AccountResult:
+    text: str
+    error: bool = False
+    risk: bool = False
+
+
+class CheckinError(Exception):
+    pass
+
+
+class RiskControlError(CheckinError):
+    pass
 
 
 # =============================================================================
@@ -96,10 +121,7 @@ def pushplus(token, title, content):
             )
 
     except requests.RequestException as e:
-        github_warning(
-            "PushPlus推送失败",
-            str(e),
-        )
+        github_warning("PushPlus推送失败", e)
 
 
 # =============================================================================
@@ -108,36 +130,30 @@ def pushplus(token, title, content):
 
 def get_accounts():
     """
-    多账号格式保持和你原来一致：
-
     GLADOS_COOKIE:
+
+    单账号：
+        cookie1
+
+    多账号：
         cookie1&cookie2&cookie3
     """
-
     raw = os.environ.get("GLADOS_COOKIE", "").strip()
 
     if not raw:
         return []
 
     return [
-        item.strip()
-        for item in raw.split("&")
-        if item.strip()
+        cookie.strip()
+        for cookie in raw.split("&")
+        if cookie.strip()
     ]
 
 
-def parse_cookie_header(cookie_string):
-    """
-    把：
-
-        koa:sess=xxx; koa:sess.sig=yyy
-
-    转成 Playwright cookies。
-    """
-
+def parse_cookie(cookie_string):
     cookies = []
 
-    ignored_names = {
+    ignored = {
         "path",
         "domain",
         "expires",
@@ -158,10 +174,7 @@ def parse_cookie_header(cookie_string):
         name = name.strip()
         value = value.strip()
 
-        if not name:
-            continue
-
-        if name.lower() in ignored_names:
+        if not name or name.lower() in ignored:
             continue
 
         cookies.append({
@@ -176,96 +189,68 @@ def parse_cookie_header(cookie_string):
 
 
 # =============================================================================
-# GLaDOS 页面状态
+# 账号状态
 # =============================================================================
 
-def get_status(page):
+def get_account_status(page):
     """
-    状态请求仍然通过浏览器页面执行。
-
-    注意这里不是 requests 请求，而是：
-
-        Chromium
-            ↓
-        glados.cloud 页面
-            ↓
-        window.fetch('/api/user/status')
-
-    因此 Cookie、Origin、浏览器上下文都属于实际网页 Session。
+    在真实浏览器页面上下文中请求 /api/user/status。
     """
 
-    try:
-        result = page.evaluate(
-            """
-            async () => {
-                try {
-                    const response = await fetch(
-                        '/api/user/status',
-                        {
-                            method: 'GET',
-                            credentials: 'include',
-                            headers: {
-                                'Accept': 'application/json, text/plain, */*'
-                            }
+    result = page.evaluate(
+        """
+        async () => {
+            try {
+                const response = await fetch(
+                    '/api/user/status',
+                    {
+                        method: 'GET',
+                        credentials: 'include',
+                        headers: {
+                            'Accept': 'application/json, text/plain, */*'
                         }
-                    );
-
-                    const text = await response.text();
-
-                    let data = null;
-
-                    try {
-                        data = JSON.parse(text);
-                    } catch (e) {
                     }
+                );
 
-                    return {
-                        ok: response.ok,
-                        status: response.status,
-                        data: data,
-                        text: text.substring(0, 500)
-                    };
+                const text = await response.text();
 
-                } catch (e) {
-                    return {
-                        ok: false,
-                        status: 0,
-                        data: null,
-                        text: String(e)
-                    };
-                }
+                let data = null;
+
+                try {
+                    data = JSON.parse(text);
+                } catch (_) {}
+
+                return {
+                    ok: response.ok,
+                    status: response.status,
+                    data: data,
+                    text: text.substring(0, 500)
+                };
+
+            } catch (e) {
+                return {
+                    ok: false,
+                    status: 0,
+                    data: null,
+                    text: String(e)
+                };
             }
-            """
-        )
-
-        return result
-
-    except Exception as e:
-        return {
-            "ok": False,
-            "status": 0,
-            "data": None,
-            "text": str(e),
         }
+        """
+    )
 
+    if not result or not result.get("ok"):
+        status = result.get("status", 0) if result else 0
+        text = result.get("text", "") if result else ""
 
-def parse_account_status(result):
-    if not result:
-        return None, "状态接口没有返回结果"
-
-    status_code = result.get("status", 0)
-
-    if not result.get("ok"):
-        return (
-            None,
-            f"状态接口 HTTP {status_code}: "
-            f"{result.get('text', '')}",
+        raise CheckinError(
+            f"状态接口异常 HTTP {status}: {text}"
         )
 
     state = result.get("data")
 
     if not isinstance(state, dict):
-        return None, "状态接口返回非 JSON Object"
+        raise CheckinError("状态接口返回格式异常")
 
     data = state.get("data")
 
@@ -276,27 +261,18 @@ def parse_account_status(result):
             or "接口未返回 data"
         )
 
-        return None, message
+        raise CheckinError(message)
 
-    email = (
-        data.get("email")
-        or "未知账号"
-    )
+    email = data.get("email") or "未知账号"
 
     left_days = data.get("leftDays")
 
     if left_days is None:
-        left_days_text = "未知"
+        left_days = "未知"
     else:
-        try:
-            left_days_text = str(left_days).split(".")[0]
-        except Exception:
-            left_days_text = str(left_days)
+        left_days = str(left_days).split(".")[0]
 
-    return {
-        "email": email,
-        "left_days": left_days_text,
-    }, None
+    return email, left_days
 
 
 # =============================================================================
@@ -304,15 +280,7 @@ def parse_account_status(result):
 # =============================================================================
 
 def find_checkin_button(page):
-    """
-    多套 selector：
-
-    1. button role + 签到
-    2. button text
-    3. Semantic UI class
-    """
-
-    candidates = [
+    selectors = [
         page.get_by_role(
             "button",
             name=re.compile(
@@ -329,223 +297,121 @@ def find_checkin_button(page):
         ),
 
         page.locator(".ui.green.huge.button"),
-
         page.locator(".ui.positive.button"),
     ]
 
-    for locator in candidates:
+    for locator in selectors:
         try:
-            count = locator.count()
+            for i in range(locator.count()):
+                button = locator.nth(i)
 
-            for i in range(count):
-                item = locator.nth(i)
-
-                if item.is_visible():
-                    return item
+                if button.is_visible():
+                    return button
 
         except Exception:
-            continue
+            pass
 
     return None
 
 
 def wait_for_checkin_button(page):
-    """
-    React 页面加载可能稍慢。
-    最多等待约 20 秒。
-    """
-
     for _ in range(20):
         button = find_checkin_button(page)
 
-        if button is not None:
+        if button:
             return button
 
         page.wait_for_timeout(1000)
 
-    return None
+    raise CheckinError("未找到网页签到按钮")
 
 
 # =============================================================================
 # 签到结果
 # =============================================================================
 
-def extract_message(data):
+def classify_checkin(data):
     if not isinstance(data, dict):
-        return ""
+        raise CheckinError("签到接口返回格式异常")
 
-    return str(
+    message = str(
         data.get("message")
         or data.get("msg")
         or ""
     ).strip()
 
-
-def is_risk_control(message):
-    message = message.lower()
-
-    return any(
-        keyword in message
-        for keyword in RISK_CONTROL_KEYWORDS
-    )
-
-
-def classify_checkin_result(data):
-    """
-    返回：
-
-        success
-        repeat
-        risk
-        error
-    """
-
-    if not isinstance(data, dict):
-        return "error", "签到接口返回格式异常"
-
-    message = extract_message(data)
     lower = message.lower()
 
-    # -------------------------
-    # 风控必须优先判断
-    # -------------------------
+    # 风控优先级最高
+    if any(keyword in lower for keyword in RISK_KEYWORDS):
+        raise RiskControlError(message or "检测到自动化签到")
 
-    if is_risk_control(message):
-        return "risk", message
-
-    # -------------------------
-    # 重复签到
-    # -------------------------
-
-    if any(
-        keyword in lower
-        for keyword in REPEAT_KEYWORDS
-    ):
+    # 已签到属于正常结果
+    if any(keyword in lower for keyword in REPEAT_KEYWORDS):
         return "repeat", message
 
-    # -------------------------
-    # 明确成功
-    # -------------------------
-
-    if any(
-        keyword in lower
-        for keyword in SUCCESS_KEYWORDS
-    ):
+    # 明确签到成功
+    if any(keyword in lower for keyword in SUCCESS_KEYWORDS):
         return "success", message
 
-    # GLaDOS 历史上 code == 0 表示正常成功
+    # 历史接口 code == 0 也视为成功
     if data.get("code") == 0:
-        return (
-            "success",
-            message or "签到成功",
-        )
+        return "success", message or "签到成功"
 
-    # -------------------------
-    # 未知结果
-    # -------------------------
-
-    return (
-        "error",
+    raise CheckinError(
         message
-        or f"未知签到结果: {json.dumps(data, ensure_ascii=False)}",
+        or f"未知签到结果: {json.dumps(data, ensure_ascii=False)}"
     )
 
 
 # =============================================================================
-# 调试截图
+# 调试
 # =============================================================================
 
-def save_debug_screenshot(page, account_index):
-    if not SAVE_DEBUG_SCREENSHOT:
+def save_screenshot(page, account_index):
+    if not SAVE_DEBUG_SCREENSHOT or page is None:
         return
 
     try:
         directory = Path("debug")
+        directory.mkdir(exist_ok=True)
 
-        directory.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
-
-        path = (
-            directory
-            / f"account_{account_index}_failure.png"
-        )
+        path = directory / f"account_{account_index}_failure.png"
 
         page.screenshot(
             path=str(path),
             full_page=True,
         )
 
-        log(
-            f"已保存调试截图: {path}"
-        )
+        log(f"调试截图: {path}")
 
     except Exception as e:
-        github_warning(
-            "调试截图失败",
-            str(e),
-        )
+        github_warning("保存截图失败", e)
 
 
 # =============================================================================
-# 单账号
+# 单账号签到
 # =============================================================================
 
-def process_account(
-    browser,
-    cookie_string,
-    account_index,
-):
-    """
-    返回：
-
-        {
-            "error": bool,
-            "risk": bool,
-            "text": str,
-        }
-    """
-
+def process_account(browser, cookie_string, index):
     context = browser.new_context()
-
     page = None
 
-    try:
-        # ---------------------------------------------------------------------
-        # 注入 Cookie
-        # ---------------------------------------------------------------------
+    email = f"账号{index}"
+    left_days = "未知"
 
-        cookies = parse_cookie_header(
-            cookie_string
-        )
+    try:
+        cookies = parse_cookie(cookie_string)
 
         if not cookies:
-            return {
-                "error": True,
-                "risk": False,
-                "text": (
-                    f"账号{account_index}"
-                    "----Cookie格式异常"
-                ),
-            }
+            raise CheckinError("Cookie 格式异常")
 
         context.add_cookies(cookies)
 
-        # ---------------------------------------------------------------------
-        # 打开真实网页
-        # ---------------------------------------------------------------------
-
         page = context.new_page()
+        page.set_default_timeout(PAGE_TIMEOUT)
 
-        page.set_default_timeout(
-            PAGE_TIMEOUT
-        )
-
-        log(
-            f"账号 {account_index}: "
-            "打开 GLaDOS 签到页面"
-        )
+        log(f"{email}: 打开 GLaDOS 签到页面")
 
         page.goto(
             CHECKIN_PAGE,
@@ -553,56 +419,21 @@ def process_account(
             timeout=PAGE_TIMEOUT,
         )
 
-        # React 初始化
         try:
             page.wait_for_load_state(
                 "networkidle",
                 timeout=10_000,
             )
         except PlaywrightTimeoutError:
-            # networkidle 不是必须条件
             pass
 
         page.wait_for_timeout(1000)
 
         # ---------------------------------------------------------------------
-        # 先验证登录状态
+        # 登录状态
         # ---------------------------------------------------------------------
 
-        status_result = get_status(page)
-
-        account, status_error = (
-            parse_account_status(
-                status_result
-            )
-        )
-
-        if status_error:
-            github_error(
-                "GLaDOS登录状态异常",
-                (
-                    f"账号 {account_index}: "
-                    f"{status_error}"
-                ),
-            )
-
-            save_debug_screenshot(
-                page,
-                account_index,
-            )
-
-            return {
-                "error": True,
-                "risk": False,
-                "text": (
-                    f"账号{account_index}"
-                    f"----登录状态异常"
-                    f"----{status_error}"
-                ),
-            }
-
-        email = account["email"]
-        left_days = account["left_days"]
+        email, left_days = get_account_status(page)
 
         log(
             f"{email}: 登录状态正常，"
@@ -610,346 +441,169 @@ def process_account(
         )
 
         # ---------------------------------------------------------------------
-        # 查找签到按钮
+        # 找签到按钮
         # ---------------------------------------------------------------------
 
-        button = wait_for_checkin_button(
-            page
-        )
-
-        if button is None:
-            github_error(
-                "未找到签到按钮",
-                email,
-            )
-
-            save_debug_screenshot(
-                page,
-                account_index,
-            )
-
-            return {
-                "error": True,
-                "risk": False,
-                "text": (
-                    f"{email}"
-                    "----未找到网页签到按钮"
-                    f"----剩余({left_days})天"
-                ),
-            }
+        button = wait_for_checkin_button(page)
 
         log(
-            f"{email}: 找到签到按钮，"
-            "准备执行网页点击"
+            f"{email}: 找到签到按钮，准备执行网页点击"
         )
 
         # ---------------------------------------------------------------------
-        # 关键：
-        #
-        # 不直接 POST API。
-        #
-        # 而是：
-        #
-        # 浏览器 click()
-        #       ↓
-        # GLaDOS 前端 JS
-        #       ↓
-        # /api/user/checkin
-        #
-        # 同时监听页面产生的响应。
+        # 点击真实网页按钮，并监听网页自己产生的签到请求
         # ---------------------------------------------------------------------
 
         try:
             with page.expect_response(
                 lambda response:
-                "/api/user/checkin"
-                in response.url
-                and response.request.method.upper()
-                == "POST",
+                    "/api/user/checkin" in response.url
+                    and response.request.method.upper() == "POST",
                 timeout=CHECKIN_TIMEOUT,
             ) as response_info:
 
-                button.click(
-                    timeout=10_000
-                )
+                button.click(timeout=10_000)
 
-            checkin_response = (
-                response_info.value
-            )
+            response = response_info.value
 
         except PlaywrightTimeoutError:
-            github_error(
-                "签到响应超时",
-                (
-                    f"{email}: "
-                    "点击按钮后未检测到"
-                    "签到接口响应"
-                ),
+            raise CheckinError(
+                "点击按钮后未检测到签到接口响应"
             )
-
-            save_debug_screenshot(
-                page,
-                account_index,
-            )
-
-            return {
-                "error": True,
-                "risk": False,
-                "text": (
-                    f"{email}"
-                    "----签到响应超时"
-                    f"----剩余({left_days})天"
-                ),
-            }
 
         # ---------------------------------------------------------------------
-        # HTTP 状态
+        # HTTP
         # ---------------------------------------------------------------------
 
-        if not checkin_response.ok:
-            github_error(
-                "GLaDOS签到HTTP异常",
-                (
-                    f"{email}: "
-                    f"HTTP "
-                    f"{checkin_response.status}"
-                ),
+        if not response.ok:
+            raise CheckinError(
+                f"签到接口 HTTP {response.status}"
             )
-
-            save_debug_screenshot(
-                page,
-                account_index,
-            )
-
-            return {
-                "error": True,
-                "risk": False,
-                "text": (
-                    f"{email}"
-                    "----签到HTTP异常"
-                    f"----HTTP "
-                    f"{checkin_response.status}"
-                    f"----剩余({left_days})天"
-                ),
-            }
 
         # ---------------------------------------------------------------------
-        # 读取网页签到产生的 JSON
+        # JSON
         # ---------------------------------------------------------------------
 
         try:
-            checkin_data = (
-                checkin_response.json()
-            )
+            checkin_data = response.json()
 
         except Exception:
             try:
-                text = (
-                    checkin_response
-                    .body()
-                    .decode(
-                        "utf-8",
-                        errors="replace",
-                    )
+                body = response.body().decode(
+                    "utf-8",
+                    errors="replace",
                 )
-
             except Exception:
-                text = ""
+                body = ""
 
-            github_error(
-                "GLaDOS签到返回异常",
-                (
-                    f"{email}: "
-                    "返回内容不是 JSON "
-                    f"{text[:200]}"
-                ),
+            raise CheckinError(
+                f"签到接口返回非 JSON 数据: {body[:300]}"
             )
-
-            save_debug_screenshot(
-                page,
-                account_index,
-            )
-
-            return {
-                "error": True,
-                "risk": False,
-                "text": (
-                    f"{email}"
-                    "----签到接口返回异常"
-                    f"----剩余({left_days})天"
-                ),
-            }
 
         # ---------------------------------------------------------------------
-        # 判断签到结果
+        # 关键新增：
+        # 无论成功、重复签到还是风控，都打印服务端完整响应
         # ---------------------------------------------------------------------
 
-        result_type, message = (
-            classify_checkin_result(
-                checkin_data
-            )
+        log(
+            f"{email}: 签到响应 "
+            f"HTTP {response.status} = "
+            f"{json.dumps(checkin_data, ensure_ascii=False)}"
         )
 
         # ---------------------------------------------------------------------
-        # 风控
+        # 判断业务结果
         # ---------------------------------------------------------------------
 
-        if result_type == "risk":
-            github_error(
-                "GLaDOS触发自动化检测",
-                f"{email}: {message}",
-            )
-
-            save_debug_screenshot(
-                page,
-                account_index,
-            )
-
-            return {
-                "error": True,
-                "risk": True,
-                "text": (
-                    f"{email}"
-                    "----签到失败"
-                    f"----{message}"
-                    f"----剩余({left_days})天"
-                ),
-            }
-
-        # ---------------------------------------------------------------------
-        # 未知异常
-        # ---------------------------------------------------------------------
-
-        if result_type == "error":
-            github_error(
-                "GLaDOS签到结果异常",
-                f"{email}: {message}",
-            )
-
-            log(
-                "签到接口返回: "
-                + json.dumps(
-                    checkin_data,
-                    ensure_ascii=False,
-                )[:500]
-            )
-
-            save_debug_screenshot(
-                page,
-                account_index,
-            )
-
-            return {
-                "error": True,
-                "risk": False,
-                "text": (
-                    f"{email}"
-                    "----签到异常"
-                    f"----{message}"
-                    f"----剩余({left_days})天"
-                ),
-            }
-
-        # ---------------------------------------------------------------------
-        # 签到完成后重新读取状态
-        # ---------------------------------------------------------------------
-
-        page.wait_for_timeout(1000)
-
-        new_status = get_status(page)
-
-        new_account, new_status_error = (
-            parse_account_status(
-                new_status
-            )
+        result_type, message = classify_checkin(
+            checkin_data
         )
-
-        if new_account:
-            left_days = (
-                new_account["left_days"]
-            )
-
-        elif new_status_error:
-            github_warning(
-                "签到后状态刷新失败",
-                (
-                    f"{email}: "
-                    f"{new_status_error}"
-                ),
-            )
-
-        # ---------------------------------------------------------------------
-        # 正常
-        # ---------------------------------------------------------------------
 
         if result_type == "repeat":
-            log(
-                f"{email}: 今日已经签到"
-            )
-
+            log(f"{email}: 今日已经签到")
         else:
-            log(
-                f"{email}: 签到成功"
+            log(f"{email}: 签到成功")
+
+        # ---------------------------------------------------------------------
+        # 签到后重新获取剩余天数
+        # ---------------------------------------------------------------------
+
+        try:
+            page.wait_for_timeout(1000)
+
+            _, new_left_days = get_account_status(page)
+
+            left_days = new_left_days
+
+        except CheckinError as e:
+            github_warning(
+                "签到后状态刷新失败",
+                f"{email}: {e}",
             )
 
-        return {
-            "error": False,
-            "risk": False,
-            "text": (
+        return AccountResult(
+            text=(
                 f"{email}"
                 f"----{message}"
                 f"----剩余({left_days})天"
-            ),
-        }
-
-    except PlaywrightTimeoutError as e:
-        github_error(
-            "Playwright超时",
-            (
-                f"账号 {account_index}: "
-                f"{e}"
-            ),
+            )
         )
 
-        if page:
-            save_debug_screenshot(
-                page,
-                account_index,
-            )
+    except RiskControlError as e:
+        message = str(e)
 
-        return {
-            "error": True,
-            "risk": False,
-            "text": (
-                f"账号{account_index}"
-                "----Playwright超时"
+        github_error(
+            "GLaDOS触发自动化检测",
+            f"{email}: {message}",
+        )
+
+        save_screenshot(page, index)
+
+        return AccountResult(
+            text=(
+                f"{email}"
+                f"----签到失败"
+                f"----{message}"
+                f"----剩余({left_days})天"
             ),
-        }
+            error=True,
+            risk=True,
+        )
+
+    except CheckinError as e:
+        github_error(
+            "GLaDOS签到异常",
+            f"{email}: {e}",
+        )
+
+        save_screenshot(page, index)
+
+        return AccountResult(
+            text=(
+                f"{email}"
+                f"----签到异常"
+                f"----{e}"
+                f"----剩余({left_days})天"
+            ),
+            error=True,
+        )
 
     except Exception as e:
         github_error(
-            "GLaDOS签到脚本异常",
-            (
-                f"账号 {account_index}: "
-                f"{type(e).__name__}: {e}"
-            ),
+            "GLaDOS脚本异常",
+            f"{email}: {type(e).__name__}: {e}",
         )
 
-        if page:
-            save_debug_screenshot(
-                page,
-                account_index,
-            )
+        save_screenshot(page, index)
 
-        return {
-            "error": True,
-            "risk": False,
-            "text": (
-                f"账号{account_index}"
-                "----执行异常"
+        return AccountResult(
+            text=(
+                f"{email}"
+                f"----执行异常"
                 f"----{type(e).__name__}: {e}"
             ),
-        }
+            error=True,
+        )
 
     finally:
         context.close()
@@ -960,11 +614,6 @@ def process_account(
 # =============================================================================
 
 def main():
-    pushplus_token = os.environ.get(
-        "PUSHPLUS_TOKEN",
-        "",
-    )
-
     accounts = get_accounts()
 
     if not accounts:
@@ -972,26 +621,23 @@ def main():
             "配置错误",
             "未获取到 GLADOS_COOKIE",
         )
-
         return 1
 
-    has_error = False
-    risk_control_triggered = False
+    pushplus_token = os.environ.get(
+        "PUSHPLUS_TOKEN",
+        "",
+    )
+
+    log(f"共发现 {len(accounts)} 个账号")
 
     results = []
 
-    log(
-        f"共发现 {len(accounts)} 个账号"
-    )
-
-    # =========================================================================
-    # Playwright
-    # =========================================================================
+    has_error = False
+    risk_triggered = False
 
     with sync_playwright() as playwright:
-
         browser = playwright.chromium.launch(
-            headless=False,
+            headless=HEADLESS,
             channel="chromium",
         )
 
@@ -1002,31 +648,19 @@ def main():
             ):
                 log("")
                 log("=" * 60)
-                log(
-                    f"开始处理第 {index} 个账号"
-                )
+                log(f"开始处理第 {index} 个账号")
                 log("=" * 60)
 
-                # -------------------------------------------------------------
-                # 如果前一个账号已经明确触发：
-                #
-                # Automated check-in detected
-                #
-                # 则本次 GitHub Runner 不继续签到剩余账号。
-                #
-                # 防止继续请求让同一个 Runner 出口产生更多风控事件。
-                # -------------------------------------------------------------
-
-                if risk_control_triggered:
+                # 前一个账号已触发明确风控，
+                # 当前 Runner 不继续发送签到请求。
+                if risk_triggered:
                     message = (
                         f"账号{index}"
                         "----本次跳过"
-                        "----前序账号已触发"
-                        "自动化检测"
+                        "----前序账号已触发自动化检测"
                     )
 
                     log(message)
-
                     results.append(message)
 
                     continue
@@ -1037,49 +671,35 @@ def main():
                     index,
                 )
 
-                results.append(
-                    result["text"]
-                )
+                results.append(result.text)
 
-                if result["error"]:
-                    has_error = True
-
-                if result["risk"]:
-                    risk_control_triggered = True
+                has_error |= result.error
+                risk_triggered |= result.risk
 
         finally:
             browser.close()
 
-    # =========================================================================
+    # -------------------------------------------------------------------------
     # PushPlus
-    # =========================================================================
+    # -------------------------------------------------------------------------
+
+    if risk_triggered:
+        title = "GLaDOS 检测到自动签到"
+    elif has_error:
+        title = "GLaDOS 签到异常"
+    else:
+        title = "GLaDOS 签到成功"
 
     if results:
-
-        if risk_control_triggered:
-            title = (
-                "GLaDOS 检测到自动签到"
-            )
-
-        elif has_error:
-            title = (
-                "GLaDOS 签到异常"
-            )
-
-        else:
-            title = (
-                "GLaDOS 签到成功"
-            )
-
         pushplus(
             pushplus_token,
             title,
             "\n".join(results),
         )
 
-    # =========================================================================
-    # GitHub Actions Exit Code
-    # =========================================================================
+    # -------------------------------------------------------------------------
+    # GitHub Actions 返回值
+    # -------------------------------------------------------------------------
 
     log("")
     log("=" * 60)
@@ -1091,13 +711,9 @@ def main():
         )
 
         log("=" * 60)
-
         return 1
 
-    log(
-        "所有账号执行正常"
-    )
-
+    log("所有账号执行正常")
     log("=" * 60)
 
     return 0

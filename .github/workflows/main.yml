@@ -1,30 +1,72 @@
-name: 开始每日签到
+name: GLaDOS Checkin
 
 on:
   workflow_dispatch:
+
   schedule:
-    # UTC 1点30分(北京时间 9点30分)
-    - cron: 30 1 * * *
-  # 标星时触发工作流程
-  watch:
-    types: [started]
+    - cron: "15 0 * * *"
+
+permissions:
+  contents: read
 
 jobs:
-  build:
+  checkin:
     runs-on: ubuntu-latest
+
+    timeout-minutes: 10
+
     steps:
-      - uses: actions/checkout@v7
-      - name: Set up Python 3.11
-        uses: actions/setup-python@v7
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
         with:
-          python-version: 3.11
-      - name: Install requirements
+          python-version: "3.11"
+
+      # ------------------------------------------------------------
+      # 1. 先安装 Python Playwright
+      # ------------------------------------------------------------
+      - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
-      - name: Run checkin
+          python -m pip install -r requirements.txt
+
+          echo "Python:"
+          python --version
+
+          echo "Playwright:"
+          python -m playwright --version
+
+      # ------------------------------------------------------------
+      # 2. 再安装与当前 Playwright 完全匹配的 Chromium
+      # ------------------------------------------------------------
+      - name: Install Playwright Chromium
         run: |
-          python3 glados.py
-        env: 
-          GLADOS_COOKIE: "${{ secrets.GLADOS_COOKIE }}"
+          python -m playwright install --with-deps chromium
+
+      # ------------------------------------------------------------
+      # 3. 可选：验证浏览器确实安装好了
+      # 出问题时这几行非常有用
+      # ------------------------------------------------------------
+      - name: Verify Playwright
+        run: |
+          python - <<'PY'
+          from playwright.sync_api import sync_playwright
+
+          with sync_playwright() as p:
+              browser = p.chromium.launch(headless=True)
+              print("Chromium launch success")
+              print("Version:", browser.version)
+              browser.close()
+          PY
+
+      # ------------------------------------------------------------
+      # 4. 正式签到
+      # ------------------------------------------------------------
+      - name: Run GLaDOS checkin
+        env:
+          GLADOS_COOKIE: ${{ secrets.GLADOS_COOKIE }}
           PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
+        run: |
+          python glados.py

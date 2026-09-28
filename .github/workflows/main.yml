@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   checkin:
-    runs-on: ubuntu-latest
+    runs-on: macos-15
 
     timeout-minutes: 10
 
@@ -43,7 +43,7 @@ jobs:
       # ------------------------------------------------------------
       - name: Install Playwright Chromium
         run: |
-          python -m playwright install --with-deps chromium
+          python -m playwright install chromium
 
       # ------------------------------------------------------------
       # 3. 可选：验证浏览器确实安装好了

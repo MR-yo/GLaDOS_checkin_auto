@@ -991,7 +991,8 @@ def main():
     with sync_playwright() as playwright:
 
         browser = playwright.chromium.launch(
-            headless=True,
+            headless=False,
+            channel="chromium",
         )
 
         try:

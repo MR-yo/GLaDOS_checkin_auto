@@ -3,55 +3,173 @@ import os
 import sys
 import time
 
-import requests
+import httpx
 
+
+# =============================================================================
+# Configuration
+# =============================================================================
 
 BASE_URL = "https://glados.rocks"
-CHECKIN_URL = f"{BASE_URL}/api/user/checkin"
-STATUS_URL = f"{BASE_URL}/api/user/status"
 
-TIMEOUT = 15
+STATUS_URL = f"{BASE_URL}/api/user/status"
+CHECKIN_URL = f"{BASE_URL}/api/user/checkin"
+
+TIMEOUT = 20.0
 MAX_RETRIES = 2
 
-USER_AGENT = (
-    "M"
-)
+# HAR 中真实值
+USER_AGENT = "M"
 
-BASE_HEADERS = {
-    "Accept": "application/json, text/plain, */*",
-    "Referer": f"{BASE_URL}/console/checkin",
-    "Origin": BASE_URL,
-    "User-Agent": USER_AGENT,
-}
+# HAR 中 POST body 的精确字节
+CHECKIN_BODY = b'{"token":"glados.rocks"}'
 
-PAYLOAD = {
-    "token": "glados.rocks"
-}
+assert len(CHECKIN_BODY) == 24
 
-RISK_KEYWORDS = (
-    "automated check-in",
-    "automated checkin",
-    "sign in again",
-    "login again",
-    "log in again",
-    "session expired",
-    "cookie expired",
-    "invalid session",
-    "unauthorized",
-)
 
-REPEAT_KEYWORDS = (
-    "checkin repeats",
-    "check-in repeats",
-    "try tomorrow",
-)
+# =============================================================================
+# HAR 中真实浏览器请求头
+#
+# 注意：
+# HTTP/2 的
+#
+# :authority
+# :method
+# :path
+# :scheme
+#
+# 由 httpx 自动生成，不能自己作为普通 Header 添加。
+# =============================================================================
 
-SUCCESS_KEYWORDS = (
-    "checkin! got",
-    "check-in! got",
-    "today's observation logged",
-)
+COMMON_HEADERS = [
+    (
+        "accept",
+        "application/json, text/plain, */*",
+    ),
+    (
+        "accept-encoding",
+        "gzip, deflate, br, zstd",
+    ),
+    (
+        "accept-language",
+        "zh,zh-CN;q=0.9,en-US;q=0.8,en;q=0.7",
+    ),
+    (
+        "cache-control",
+        "no-cache",
+    ),
+    (
+        "pragma",
+        "no-cache",
+    ),
+    (
+        "priority",
+        "u=1, i",
+    ),
+    (
+        "sec-ch-ua",
+        '""',
+    ),
+    (
+        "sec-ch-ua-mobile",
+        "?0",
+    ),
+    (
+        "sec-ch-ua-platform",
+        '""',
+    ),
+    (
+        "sec-fetch-dest",
+        "empty",
+    ),
+    (
+        "sec-fetch-mode",
+        "cors",
+    ),
+    (
+        "sec-fetch-site",
+        "same-origin",
+    ),
+    (
+        "user-agent",
+        USER_AGENT,
+    ),
+]
 
+
+CHECKIN_HEADERS = [
+    (
+        "accept",
+        "application/json, text/plain, */*",
+    ),
+    (
+        "accept-encoding",
+        "gzip, deflate, br, zstd",
+    ),
+    (
+        "accept-language",
+        "zh,zh-CN;q=0.9,en-US;q=0.8,en;q=0.7",
+    ),
+    (
+        "cache-control",
+        "no-cache",
+    ),
+
+    # HAR 明确为 24
+    (
+        "content-length",
+        "24",
+    ),
+    (
+        "content-type",
+        "application/json;charset=UTF-8",
+    ),
+    (
+        "origin",
+        BASE_URL,
+    ),
+    (
+        "pragma",
+        "no-cache",
+    ),
+    (
+        "priority",
+        "u=1, i",
+    ),
+    (
+        "sec-ch-ua",
+        '""',
+    ),
+    (
+        "sec-ch-ua-mobile",
+        "?0",
+    ),
+    (
+        "sec-ch-ua-platform",
+        '""',
+    ),
+    (
+        "sec-fetch-dest",
+        "empty",
+    ),
+    (
+        "sec-fetch-mode",
+        "cors",
+    ),
+    (
+        "sec-fetch-site",
+        "same-origin",
+    ),
+    (
+        "user-agent",
+        USER_AGENT,
+    ),
+]
+
+
+# =============================================================================
+# Log
+# =============================================================================
 
 def log(message):
     print(message, flush=True)
@@ -59,16 +177,29 @@ def log(message):
 
 def github_error(title, message):
     message = str(message).replace("\n", " ")
-    log(f"::error title={title}::{message}")
+
+    log(
+        f"::error title={title}::{message}"
+    )
 
 
 def github_warning(title, message):
     message = str(message).replace("\n", " ")
-    log(f"::warning title={title}::{message}")
 
+    log(
+        f"::warning title={title}::{message}"
+    )
+
+
+# =============================================================================
+# Account
+# =============================================================================
 
 def get_accounts():
-    raw = os.environ.get("GLADOS_COOKIE", "").strip()
+    raw = os.environ.get(
+        "GLADOS_COOKIE",
+        "",
+    ).strip()
 
     return [
         cookie.strip()
@@ -77,24 +208,64 @@ def get_accounts():
     ]
 
 
-def request(session, method, url, **kwargs):
-    """
-    网络异常、429、5xx 做有限重试。
-    业务错误不自动重试。
-    """
+# =============================================================================
+# HTTP Client
+# =============================================================================
 
+def create_client():
+    client = httpx.Client(
+        http2=True,
+
+        timeout=httpx.Timeout(
+            TIMEOUT,
+            connect=TIMEOUT,
+        ),
+
+        follow_redirects=False,
+
+        # 避免运行环境里的 HTTP_PROXY /
+        # HTTPS_PROXY 等变量干扰这次实验。
+        trust_env=False,
+    )
+
+    # httpx 默认会自动加入：
+    #
+    # User-Agent: python-httpx
+    # Accept: */*
+    # Accept-Encoding: ...
+    # Connection: keep-alive
+    #
+    # 全部清空，我们自己严格设置。
+    client.headers.clear()
+
+    return client
+
+
+# =============================================================================
+# Retry
+# =============================================================================
+
+def request(
+    client,
+    method,
+    url,
+    headers,
+    content=None,
+):
     last_error = None
 
-    for attempt in range(MAX_RETRIES + 1):
+    for attempt in range(
+        MAX_RETRIES + 1
+    ):
         try:
-            response = session.request(
+            response = client.request(
                 method,
                 url,
-                timeout=TIMEOUT,
-                **kwargs,
+                headers=headers,
+                content=content,
             )
 
-        except requests.RequestException as e:
+        except httpx.HTTPError as e:
             last_error = e
 
             if attempt >= MAX_RETRIES:
@@ -103,116 +274,222 @@ def request(session, method, url, **kwargs):
             wait = 2 ** attempt
 
             github_warning(
-                "网络请求失败",
-                f"{e}，{wait}s 后重试",
+                "网络请求异常",
+                (
+                    f"{type(e).__name__}: {e}; "
+                    f"{wait}s 后重试"
+                ),
             )
 
             time.sleep(wait)
+
             continue
 
+        # -------------------------------------------------------------
+        # 429
+        # -------------------------------------------------------------
+
         if response.status_code == 429:
+
             if attempt >= MAX_RETRIES:
                 return response
 
-            retry_after = response.headers.get("Retry-After")
+            wait = 5 * (attempt + 1)
 
-            try:
-                wait = int(retry_after)
-            except (TypeError, ValueError):
-                wait = 5 * (attempt + 1)
+            retry_after = response.headers.get(
+                "retry-after"
+            )
+
+            if retry_after:
+                try:
+                    wait = int(retry_after)
+                except ValueError:
+                    pass
 
             github_warning(
-                "接口限流",
-                f"HTTP 429，{wait}s 后重试",
+                "GLaDOS限流",
+                f"HTTP 429; {wait}s 后重试",
             )
 
             time.sleep(wait)
+
             continue
 
+        # -------------------------------------------------------------
+        # 5xx
+        # -------------------------------------------------------------
+
         if 500 <= response.status_code < 600:
+
             if attempt >= MAX_RETRIES:
                 return response
 
             wait = 2 ** (attempt + 1)
 
             github_warning(
-                "服务端异常",
-                f"HTTP {response.status_code}，{wait}s 后重试",
+                "GLaDOS服务异常",
+                (
+                    f"HTTP {response.status_code}; "
+                    f"{wait}s 后重试"
+                ),
             )
 
             time.sleep(wait)
+
             continue
 
         return response
 
-    raise last_error or RuntimeError("请求失败")
+    raise last_error or RuntimeError(
+        "HTTP request failed"
+    )
 
 
-def parse_json(response, name):
+# =============================================================================
+# JSON
+# =============================================================================
+
+def parse_json(response):
     try:
         return response.json()
 
     except ValueError:
-        github_error(
-            f"{name}返回异常",
+        raise RuntimeError(
             (
+                "接口返回非 JSON: "
                 f"HTTP {response.status_code}, "
-                f"非 JSON: {response.text[:500]}"
-            ),
+                f"{response.text[:500]}"
+            )
         )
 
-        return None
+
+# =============================================================================
+# Debug request
+# =============================================================================
+
+def print_request(response):
+    """
+    输出 httpx 最终实际构造的 HTTP Header。
+
+    Cookie 脱敏。
+    """
+
+    request = response.request
+
+    log(
+        f"实际请求: "
+        f"{request.method} {request.url}"
+    )
+
+    for name, value in request.headers.multi_items():
+
+        if name.lower() == "cookie":
+            value = "***"
+
+        log(
+            f"  {name}: {value}"
+        )
+
+    if request.content:
+        try:
+            body = request.content.decode()
+        except Exception:
+            body = "<binary>"
+
+        log(
+            f"  body: {body}"
+        )
 
 
-def get_status(session):
+# =============================================================================
+# Status
+# =============================================================================
+
+def get_status(
+    client,
+    cookie,
+):
+    headers = [
+        *COMMON_HEADERS,
+
+        # HAR 为安全原因没有导出 Cookie，
+        # 实际认证请求必须携带。
+        (
+            "cookie",
+            cookie,
+        ),
+    ]
+
     response = request(
-        session,
+        client,
         "GET",
         STATUS_URL,
+        headers,
     )
 
-    if not response.ok:
+    log(
+        (
+            f"状态接口: "
+            f"{response.http_version} "
+            f"HTTP {response.status_code}"
+        )
+    )
+
+    if not response.is_success:
         raise RuntimeError(
-            f"状态接口 HTTP {response.status_code}"
+            (
+                f"状态接口 HTTP "
+                f"{response.status_code}: "
+                f"{response.text[:300]}"
+            )
         )
 
-    data = parse_json(
-        response,
-        "状态接口",
-    )
+    result = parse_json(response)
+
+    data = result.get("data")
 
     if not isinstance(data, dict):
-        raise RuntimeError("状态接口数据格式异常")
 
-    account = data.get("data")
-
-    if not isinstance(account, dict):
         message = (
-            data.get("message")
-            or data.get("msg")
-            or "状态接口未返回 data"
+            result.get("message")
+            or result.get("reason")
+            or "status 未返回 data"
         )
 
         raise RuntimeError(message)
 
     email = (
-        account.get("email")
+        data.get("email")
         or "未知账号"
     )
 
-    left_days = account.get("leftDays")
+    left_days = data.get(
+        "leftDays",
+        "未知",
+    )
 
-    if left_days is None:
-        left_days = "未知"
-    else:
-        left_days = str(left_days).split(".")[0]
+    if left_days != "未知":
+        left_days = str(
+            left_days
+        ).split(".")[0]
 
-    return email, left_days
+    return (
+        email,
+        left_days,
+    )
 
+
+# =============================================================================
+# Checkin classification
+# =============================================================================
 
 def classify_checkin(data):
-    if not isinstance(data, dict):
-        return "error", "签到接口数据格式异常"
+    code = data.get("code")
+
+    reason = str(
+        data.get("reason")
+        or ""
+    ).strip()
 
     message = str(
         data.get("message")
@@ -222,199 +499,342 @@ def classify_checkin(data):
 
     lower = message.lower()
 
-    if any(keyword in lower for keyword in RISK_KEYWORDS):
-        return "risk", message
+    # -------------------------------------------------------------
+    # 风控
+    # -------------------------------------------------------------
 
-    if any(keyword in lower for keyword in REPEAT_KEYWORDS):
-        return "repeat", message
+    if (
+        reason == "device-mismatch"
+        or "automated check-in" in lower
+        or "sign in again" in lower
+    ):
+        return (
+            "risk",
+            message,
+        )
 
-    if any(keyword in lower for keyword in SUCCESS_KEYWORDS):
-        return "success", message
+    # -------------------------------------------------------------
+    # 重复签到
+    # -------------------------------------------------------------
 
-    if data.get("code") == 0:
-        return "success", message or "签到成功"
+    if (
+        "checkin repeats" in lower
+        or "check-in repeats" in lower
+        or "try tomorrow" in lower
+    ):
+        return (
+            "repeat",
+            message,
+        )
+
+    # -------------------------------------------------------------
+    # 正常成功
+    # -------------------------------------------------------------
+
+    if (
+        code == 0
+        or "checkin! got" in lower
+        or "check-in! got" in lower
+    ):
+        return (
+            "success",
+            message or "签到成功",
+        )
 
     return (
         "error",
-        message
-        or f"未知签到结果: {json.dumps(data, ensure_ascii=False)}",
+        (
+            message
+            or json.dumps(
+                data,
+                ensure_ascii=False,
+            )
+        ),
     )
 
 
-def pushplus(token, title, content):
+# =============================================================================
+# Checkin
+# =============================================================================
+
+def do_checkin(
+    client,
+    cookie,
+    email,
+):
+    headers = [
+        *CHECKIN_HEADERS,
+
+        # HAR 本身没有导出 Cookie，
+        # 但接口显然依赖当前登录 Session。
+        (
+            "cookie",
+            cookie,
+        ),
+    ]
+
+    response = request(
+        client,
+        "POST",
+        CHECKIN_URL,
+        headers,
+        content=CHECKIN_BODY,
+    )
+
+    # -------------------------------------------------------------
+    # 第一次测试时很重要：
+    # 打印最终由 httpx 构造出来的 Header。
+    # -------------------------------------------------------------
+
+    print_request(response)
+
+    log(
+        (
+            f"{email}: 签到协议 = "
+            f"{response.http_version}"
+        )
+    )
+
+    data = parse_json(response)
+
+    log(
+        (
+            f"{email}: 签到响应 "
+            f"HTTP {response.status_code} = "
+            f"{json.dumps(data, ensure_ascii=False)}"
+        )
+    )
+
+    return (
+        response,
+        data,
+    )
+
+
+# =============================================================================
+# PushPlus
+# =============================================================================
+
+def pushplus(
+    token,
+    title,
+    content,
+):
     if not token:
         return
 
     try:
-        response = requests.get(
-            "https://www.pushplus.plus/send",
-            params={
-                "token": token,
-                "title": title,
-                "content": content,
-            },
+        with httpx.Client(
             timeout=10,
-        )
+        ) as client:
 
-        if not response.ok:
-            github_warning(
-                "PushPlus推送失败",
-                f"HTTP {response.status_code}",
+            response = client.get(
+                "https://www.pushplus.plus/send",
+                params={
+                    "token": token,
+                    "title": title,
+                    "content": content,
+                },
             )
 
-    except requests.RequestException as e:
+            if not response.is_success:
+
+                github_warning(
+                    "PushPlus推送失败",
+                    (
+                        f"HTTP "
+                        f"{response.status_code}"
+                    ),
+                )
+
+    except Exception as e:
+
         github_warning(
             "PushPlus推送失败",
             e,
         )
 
 
-def process_account(cookie, index):
-    session = requests.Session()
+# =============================================================================
+# Process account
+# =============================================================================
 
-    session.headers.update({
-        **BASE_HEADERS,
-        "Cookie": cookie,
-    })
-
+def process_account(
+    cookie,
+    index,
+):
     email = f"账号{index}"
     left_days = "未知"
 
     try:
-        # -------------------------------------------------------------
-        # 先确认登录状态
-        # -------------------------------------------------------------
+        with create_client() as client:
 
-        email, left_days = get_status(session)
+            # ---------------------------------------------------------
+            # Status
+            # ---------------------------------------------------------
 
-        log(
-            f"{email}: 登录状态正常，"
-            f"剩余 {left_days} 天"
-        )
+            email, left_days = get_status(
+                client,
+                cookie,
+            )
 
-        # -------------------------------------------------------------
-        # 签到
-        # -------------------------------------------------------------
-
-        response = request(
-            session,
-            "POST",
-            CHECKIN_URL,
-            headers={
-                "Content-Type":
-                    "application/json;charset=UTF-8",
-            },
-            json=PAYLOAD,
-        )
-
-        checkin_data = parse_json(
-            response,
-            "签到接口",
-        )
-
-        # 完整输出服务端响应
-        if checkin_data is not None:
             log(
-                f"{email}: 签到响应 "
-                f"HTTP {response.status_code} = "
-                f"{json.dumps(checkin_data, ensure_ascii=False)}"
-            )
-        else:
-            return (
-                True,
-                False,
-                f"{email}----签到接口返回异常",
+                (
+                    f"{email}: 登录状态正常，"
+                    f"剩余 {left_days} 天"
+                )
             )
 
-        if not response.ok:
+            # ---------------------------------------------------------
+            # Checkin
+            # ---------------------------------------------------------
+
+            response, data = do_checkin(
+                client,
+                cookie,
+                email,
+            )
+
+            if not response.is_success:
+
+                raise RuntimeError(
+                    (
+                        f"签到接口 HTTP "
+                        f"{response.status_code}"
+                    )
+                )
+
+            result_type, message = (
+                classify_checkin(data)
+            )
+
+            # ---------------------------------------------------------
+            # 风控诊断
+            # ---------------------------------------------------------
+
+            if result_type == "risk":
+
+                reason = data.get(
+                    "reason",
+                    "未知",
+                )
+
+                login_device = data.get(
+                    "loginDevice",
+                    "未知",
+                )
+
+                current_device = data.get(
+                    "currentDevice",
+                    "未知",
+                )
+
+                github_error(
+                    "GLaDOS签到被拒绝",
+                    (
+                        f"{email}: "
+                        f"reason={reason}, "
+                        f"loginDevice="
+                        f"{login_device}, "
+                        f"currentDevice="
+                        f"{current_device}, "
+                        f"message={message}"
+                    ),
+                )
+
+                return (
+                    True,
+                    True,
+                    (
+                        f"{email}"
+                        f"----{message}"
+                        f"----reason={reason}"
+                        f"----登录设备={login_device}"
+                        f"----请求设备={current_device}"
+                        f"----剩余({left_days})天"
+                    ),
+                )
+
+            # ---------------------------------------------------------
+            # 其他错误
+            # ---------------------------------------------------------
+
+            if result_type == "error":
+
+                github_error(
+                    "GLaDOS签到异常",
+                    (
+                        f"{email}: "
+                        f"{message}"
+                    ),
+                )
+
+                return (
+                    True,
+                    False,
+                    (
+                        f"{email}"
+                        f"----签到异常"
+                        f"----{message}"
+                    ),
+                )
+
+            # ---------------------------------------------------------
+            # Success / repeat
+            # ---------------------------------------------------------
+
+            if result_type == "repeat":
+
+                log(
+                    f"{email}: 今日已经签到"
+                )
+
+            else:
+
+                log(
+                    f"{email}: 签到成功"
+                )
+
+            # ---------------------------------------------------------
+            # Refresh status
+            # ---------------------------------------------------------
+
+            try:
+                _, left_days = get_status(
+                    client,
+                    cookie,
+                )
+
+            except Exception as e:
+
+                github_warning(
+                    "签到后状态刷新失败",
+                    (
+                        f"{email}: "
+                        f"{type(e).__name__}: "
+                        f"{e}"
+                    ),
+                )
+
             return (
-                True,
+                False,
                 False,
                 (
                     f"{email}"
-                    f"----签到接口 HTTP "
-                    f"{response.status_code}"
-                ),
-            )
-
-        result_type, message = classify_checkin(
-            checkin_data
-        )
-
-        # -------------------------------------------------------------
-        # 风控
-        # -------------------------------------------------------------
-
-        if result_type == "risk":
-            github_error(
-                "GLaDOS触发自动化检测",
-                f"{email}: {message}",
-            )
-
-            return (
-                True,
-                True,
-                (
-                    f"{email}"
-                    f"----签到失败"
                     f"----{message}"
                     f"----剩余({left_days})天"
                 ),
             )
-
-        # -------------------------------------------------------------
-        # 未知异常
-        # -------------------------------------------------------------
-
-        if result_type == "error":
-            github_error(
-                "GLaDOS签到异常",
-                f"{email}: {message}",
-            )
-
-            return (
-                True,
-                False,
-                (
-                    f"{email}"
-                    f"----签到异常"
-                    f"----{message}"
-                    f"----剩余({left_days})天"
-                ),
-            )
-
-        # -------------------------------------------------------------
-        # 成功 / 重复签到
-        # -------------------------------------------------------------
-
-        if result_type == "repeat":
-            log(f"{email}: 今日已经签到")
-        else:
-            log(f"{email}: 签到成功")
-
-        # 再查一次最新剩余天数
-        try:
-            _, left_days = get_status(session)
-        except Exception as e:
-            github_warning(
-                "签到后状态刷新失败",
-                f"{email}: {e}",
-            )
-
-        return (
-            False,
-            False,
-            (
-                f"{email}"
-                f"----{message}"
-                f"----剩余({left_days})天"
-            ),
-        )
 
     except Exception as e:
+
         github_error(
-            "GLaDOS签到异常",
-            f"{email}: {type(e).__name__}: {e}",
+            "GLaDOS执行异常",
+            (
+                f"{email}: "
+                f"{type(e).__name__}: "
+                f"{e}"
+            ),
         )
 
         return (
@@ -427,14 +847,16 @@ def process_account(cookie, index):
             ),
         )
 
-    finally:
-        session.close()
 
+# =============================================================================
+# Main
+# =============================================================================
 
 def main():
     accounts = get_accounts()
 
     if not accounts:
+
         github_error(
             "配置错误",
             "未获取到 GLADOS_COOKIE",
@@ -442,13 +864,26 @@ def main():
 
         return 1
 
-    pushplus_token = os.environ.get(
+    push_token = os.environ.get(
         "PUSHPLUS_TOKEN",
         "",
     )
 
-    log(f"接口地址: {BASE_URL}")
-    log(f"共发现 {len(accounts)} 个账号")
+    log(
+        f"接口地址: {BASE_URL}"
+    )
+
+    log(
+        f"User-Agent: {USER_AGENT}"
+    )
+
+    log(
+        "HTTP client: httpx + HTTP/2"
+    )
+
+    log(
+        f"共发现 {len(accounts)} 个账号"
+    )
 
     results = []
 
@@ -461,14 +896,19 @@ def main():
     ):
         log("")
         log("=" * 60)
-        log(f"开始处理第 {index} 个账号")
+
+        log(
+            f"开始处理第 {index} 个账号"
+        )
+
         log("=" * 60)
 
         if risk_triggered:
+
             message = (
                 f"账号{index}"
-                "----本次跳过"
-                "----前序账号已触发自动化检测"
+                "----跳过"
+                "----前序账号已触发风控"
             )
 
             log(message)
@@ -477,24 +917,24 @@ def main():
 
             continue
 
-        error, risk, message = (
+        error, risk, result = (
             process_account(
                 cookie,
                 index,
             )
         )
 
-        results.append(message)
+        results.append(result)
 
         has_error |= error
         risk_triggered |= risk
 
-    # -------------------------------------------------------------
-    # PushPlus
-    # -------------------------------------------------------------
+    # -------------------------------------------------------------------------
+    # Push
+    # -------------------------------------------------------------------------
 
     if risk_triggered:
-        title = "GLaDOS 检测到自动签到"
+        title = "GLaDOS 签到被拒绝"
 
     elif has_error:
         title = "GLaDOS 签到异常"
@@ -502,21 +942,21 @@ def main():
     else:
         title = "GLaDOS 签到成功"
 
-    if results:
-        pushplus(
-            pushplus_token,
-            title,
-            "\n".join(results),
-        )
+    pushplus(
+        push_token,
+        title,
+        "\n".join(results),
+    )
 
-    # -------------------------------------------------------------
-    # GitHub Actions Exit Code
-    # -------------------------------------------------------------
+    # -------------------------------------------------------------------------
+    # Exit
+    # -------------------------------------------------------------------------
 
     log("")
     log("=" * 60)
 
     if has_error:
+
         log(
             "本次签到存在异常，"
             "GitHub Actions 将标记为失败"
@@ -526,7 +966,10 @@ def main():
 
         return 1
 
-    log("所有账号执行正常")
+    log(
+        "所有账号执行正常"
+    )
+
     log("=" * 60)
 
     return 0
